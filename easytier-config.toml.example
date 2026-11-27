@@ -5,7 +5,9 @@
 instance_name = "YOUR_INSTANCE_NAME"
 # 每台机器必须使用唯一 UUID, 不要复用
 instance_id = "00000000-0000-0000-0000-000000000000"
-dhcp = true
+# 固定 IP: 关掉 DHCP 并写死 ipv4, 否则重启顺序不同会导致地址漂移
+dhcp = false
+ipv4 = "10.126.126.5"
 listeners = [
 "tcp://0.0.0.0:11010",
 "udp://0.0.0.0:11010",

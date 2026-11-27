@@ -59,7 +59,7 @@ TierHive 的 128MB NAT VPS 配置极为紧凑：
 | 加载内核模块 | 25–28 | **21** | ↓ 25% |
 | 开机服务 | 6 | **4–5** | 精简 |
 | 空闲可用内存 | ~35 MB | **~29–33 MB**（含 EasyTier） | 更健康 |
-| IPv6 | 启用 | **内核级禁用** | 省线程/内存 |
+| IPv6 | 一律启用 | **先探测，有则开、无则关** | 无 IPv6 的机器省线程/内存 |
 | 日志 | 落盘 | **内存环形缓冲 + 轮转** | 免磁盘写 |
 
 ---
@@ -97,17 +97,57 @@ TierHive 的 128MB NAT VPS 配置极为紧凑：
 ipv6.disable=1 audit=0 nowatchdog
 ```
 
-- `ipv6.disable=1`：内核级关闭 IPv6，省去相关线程与内存分配；
+- `ipv6.disable=1`：内核级关闭 IPv6，省去相关线程与内存分配（**仅在确认上游没有 IPv6 时才加**，见下节）；
 - `audit=0`：关闭审计子系统（VPS 无意义）；
 - `nowatchdog`：关闭 soft/hard lockup 检测线程。
 
-**3. initramfs 精简**
+**3. IPv6：先探测，再决定**
+
+不要无脑关掉 IPv6——有 IPv6 的机器关掉反而丢了一条免费的原生出口。上手先测三件事：
+
+```sh
+ip -6 addr show scope global          # 有没有全局地址
+ip -6 route | grep default            # 有没有 v6 默认路由
+curl -6 -s -m 8 https://api64.ipify.org   # 能不能真的走 v6 出网
+```
+
+拿不到地址时，再区分是「没配」还是「上游根本没有」：
+
+```sh
+# 1) 重初始化 IPv6（不影响 IPv4），看是否收到 RA
+sysctl -w net.ipv6.conf.eth0.disable_ipv6=1
+sysctl -w net.ipv6.conf.eth0.accept_ra=2
+sysctl -w net.ipv6.conf.eth0.disable_ipv6=0
+sleep 10 && ip -6 addr show eth0
+
+# 2) 再试 DHCPv6，仍无租约即判定上游无 IPv6
+udhcpc6 -i eth0 -n -q -t 3 -T 3
+```
+
+判定与处置：
+
+| 探测结果 | 处置 |
+|---|---|
+| 有 RA / 有 DHCPv6 租约 / `curl -6` 通 | **开启**，写静态地址（面板给的段 + 网关） |
+| 只有链路本地地址，`curl -6` 失败 | **关闭**：`ipv6.disable=1` + `sysctl disable_ipv6=1` |
+
+本仓库三台机器的实测结论：
+
+| 节点 | 探测结果 | 处置 |
+|---|---|---|
+| `jp` | 无 RA、无 DHCPv6、`curl -6` 失败 | 内核级禁用 |
+| `de` | 同上 | 内核级禁用 |
+| `or` | 面板提供 `2a11:6c7:2500:8401::/64` | 开启，静态 `::2/64`，网关 `::1` |
+
+`or` 额外做了「强制 IPv6 出口」：musl 不读 `/etc/gai.conf`，改用 `RES_OPTIONS=inet6` 注入 `/etc/conf.d/sshd`，这样即便是 IPv4 连进来的 `ssh -D` 动态转发，隧道内的解析与出网也优先走 IPv6。
+
+**4. initramfs 精简**
 
 `features="base ext4 virtio"`，移除 USB / CDROM / NVMe / RAID / 云厂商驱动。
 
-**4. 配套处理**
+**5. 配套处理**
 
-- 注释 `00-alpine.conf` 中的 IPv6 sysctl（内核栈已移除，避免启动报错）；
+- 关闭 IPv6 的机器：注释 `00-alpine.conf` 中的 IPv6 sysctl（内核栈已移除，避免启动报错）；开启 IPv6 的机器则保留并写入静态地址；
 - 禁止 `debugfs` / `tracefs` 挂载；
 - 重建 `mkinitfs`。
 
@@ -182,6 +222,15 @@ rc-update add easytier default
 rc-service easytier start
 ```
 
+> **务必用固定 IP，不要依赖 DHCP。** `dhcp = true` 时地址由网络分配，重启顺序不同就可能换号——实测两台机器重启后 `10.126.126.4` / `.5` 直接互换了，SSH 全部指错。正确做法是每台写死：
+>
+> ```toml
+> dhcp = false
+> ipv4 = "10.126.126.5"   # 每台唯一，全网不重复
+> ```
+>
+> 改完 `rc-service easytier restart`，用 `easytier-cli node` 确认地址没变。
+
 验证：
 
 ```sh
@@ -247,8 +296,9 @@ rc-service webhook-tester start
 ## 快速复现
 
 ```sh
-# 1) 内核层：放入 blacklist、改引导参数、注释 IPv6 sysctl、重建 initramfs
+# 1) 内核层：放入 blacklist、改引导参数、重建 initramfs
 cp blacklist-unnecessary.conf /etc/modprobe.d/
+# 仅当上游没有 IPv6 时执行下面这行（探测方法见"阶段一 / IPv6"）
 sed -i 's/audit=0 nowatchdog/ipv6.disable=1 audit=0 nowatchdog/' /boot/extlinux.conf
 mkinitfs
 
@@ -284,6 +334,14 @@ reboot
 
 **组网**：6 个节点全部可见，P2P 直连优先，延迟 60–400 ms（视位置）。
 
+**IPv6 出口**：
+
+| 节点 | 上游 IPv6 | 实测 |
+|---|---|---|
+| `or` | 有，静态 `2a11:6c7:2500:8401::2/64` | `curl -6` 出口即该地址，`ssh -D` 隧道同样走 IPv6 |
+| `jp` | 无（无 RA、无 DHCPv6） | 内核级禁用 |
+| `de` | 无（无 RA、无 DHCPv6） | 内核级禁用 |
+
 ---
 
 ## 注意事项
@@ -292,6 +350,9 @@ reboot
 2. **zram 不可禁用**：128MB 机器依赖 zram 完成 `apk` 操作，禁用会导致升级失败甚至系统损坏。
 3. **instance_id 唯一性**：多台机器不要复用同一 `instance_id`；若冲突，改为新 UUID。
 4. **SSH 服务**：保持 OpenSSH 而非 Dropbear，避免代理环境下失联。
+5. **不要一刀切关 IPv6**：先探测再决定，有 IPv6 的机器关掉等于白丢一条原生出口。
+6. **EasyTier 用固定 IP**：`dhcp = true` 会让地址随重启漂移，务必 `dhcp = false` + 写死 `ipv4`。
+7. **改引导参数后别急着重启**：`ip link set eth0 down/up` 会清掉该网卡的默认路由（不是 DHCP 掉线），改完先用 `ip route` 确认默认路由还在。
 
 ---
 
@@ -345,7 +406,7 @@ Goals:
 | Loaded kernel modules | 25–28 | **21** | ↓ 25% |
 | Boot services | 6 | **4–5** | slimmed |
 | Free RAM (idle) | ~35 MB | **~29–33 MB** (incl. EasyTier) | healthier |
-| IPv6 | enabled | **disabled at kernel level** | fewer threads/memory |
+| IPv6 | always on | **probe first: keep if present, drop if absent** | saves threads/memory where there is none |
 | Logs | on-disk | **in-memory ring buffer + rotation** | no disk writes |
 
 ---
@@ -383,17 +444,57 @@ Keep `virtio_balloon` and `loop` — zram on this host depends on the related bl
 ipv6.disable=1 audit=0 nowatchdog
 ```
 
-- `ipv6.disable=1`: disable IPv6 at kernel level, saving threads and memory allocations;
+- `ipv6.disable=1`: disable IPv6 at kernel level, saving threads and memory allocations (**only when upstream has no IPv6** — see next section);
 - `audit=0`: disable the audit subsystem (useless on a VPS);
 - `nowatchdog`: disable soft/hard lockup detector threads.
 
-**3. Slim initramfs**
+**3. IPv6: probe first, then decide**
+
+Never blind-disable IPv6 — on a host that has it, you would throw away a free native egress. Probe three things first:
+
+```sh
+ip -6 addr show scope global               # any global address?
+ip -6 route | grep default                 # any v6 default route?
+curl -6 -s -m 8 https://api64.ipify.org    # does v6 egress actually work?
+```
+
+If there is no address, distinguish "not configured" from "upstream has none":
+
+```sh
+# 1) Re-init IPv6 (IPv4 untouched) and see whether an RA arrives
+sysctl -w net.ipv6.conf.eth0.disable_ipv6=1
+sysctl -w net.ipv6.conf.eth0.accept_ra=2
+sysctl -w net.ipv6.conf.eth0.disable_ipv6=0
+sleep 10 && ip -6 addr show eth0
+
+# 2) Then try DHCPv6; still no lease means upstream has no IPv6
+udhcpc6 -i eth0 -n -q -t 3 -T 3
+```
+
+Decision table:
+
+| Probe result | Action |
+|---|---|
+| RA received / DHCPv6 lease / `curl -6` works | **Enable**, configure a static address (panel subnet + gateway) |
+| Link-local only, `curl -6` fails | **Disable**: `ipv6.disable=1` + `sysctl disable_ipv6=1` |
+
+Measured on the three hosts in this repo:
+
+| Node | Probe result | Action |
+|---|---|---|
+| `jp` | no RA, no DHCPv6, `curl -6` fails | disabled at kernel level |
+| `de` | same as above | disabled at kernel level |
+| `or` | panel provides `2a11:6c7:2500:8401::/64` | enabled, static `::2/64`, gateway `::1` |
+
+`or` additionally forces IPv6 egress: musl ignores `/etc/gai.conf`, so `RES_OPTIONS=inet6` is injected into `/etc/conf.d/sshd`. Even an `ssh -D` tunnel entered over IPv4 then resolves and egresses over IPv6.
+
+**4. Slim initramfs**
 
 `features="base ext4 virtio"`, dropping USB / CDROM / NVMe / RAID / cloud drivers.
 
-**4. Supporting changes**
+**5. Supporting changes**
 
-- Comment out IPv6 sysctls in `00-alpine.conf` (kernel stack removed, avoid boot errors);
+- Hosts with IPv6 disabled: comment out the IPv6 sysctls in `00-alpine.conf` (kernel stack removed, avoid boot errors); hosts with IPv6 enabled keep them and get a static address;
 - Prevent `debugfs` / `tracefs` from mounting;
 - Rebuild `mkinitfs`.
 
@@ -468,6 +569,15 @@ rc-update add easytier default
 rc-service easytier start
 ```
 
+> **Use a fixed IP; do not rely on DHCP.** With `dhcp = true` the address is handed out by the network, so a different boot order can reshuffle it — after one reboot our two hosts literally swapped `10.126.126.4` / `.5` and every SSH config pointed at the wrong box. Pin it per host instead:
+>
+> ```toml
+> dhcp = false
+> ipv4 = "10.126.126.5"   # unique per host
+> ```
+>
+> Then `rc-service easytier restart` and confirm with `easytier-cli node`.
+
 Verify:
 
 ```sh
@@ -533,8 +643,9 @@ Access the WebUI over the EasyTier private network: `http://10.126.126.x:8081`. 
 ## Quick Reproduce
 
 ```sh
-# 1) Kernel layer: install blacklist, edit boot params, comment IPv6 sysctls, rebuild initramfs
+# 1) Kernel layer: install blacklist, edit boot params, rebuild initramfs
 cp blacklist-unnecessary.conf /etc/modprobe.d/
+# run the next line only if upstream has no IPv6 (see "Stage 1 / IPv6")
 sed -i 's/audit=0 nowatchdog/ipv6.disable=1 audit=0 nowatchdog/' /boot/extlinux.conf
 mkinitfs
 
@@ -570,6 +681,14 @@ After reboot, verify with `easytier-cli node` and `free -m`.
 
 **Network**: all 6 peers visible, P2P direct preferred, 60–400 ms latency depending on location.
 
+**IPv6 egress**:
+
+| Node | Upstream IPv6 | Measured |
+|---|---|---|
+| `or` | yes, static `2a11:6c7:2500:8401::2/64` | `curl -6` egresses from that address; `ssh -D` tunnels go over IPv6 too |
+| `jp` | none (no RA, no DHCPv6) | disabled at kernel level |
+| `de` | none (no RA, no DHCPv6) | disabled at kernel level |
+
 ---
 
 ## Caveats
@@ -578,6 +697,9 @@ After reboot, verify with `easytier-cli node` and `free -m`.
 2. **Do not disable zram**: 128MB machines rely on zram for `apk` operations; disabling it causes upgrade failures or even a broken system.
 3. **Unique instance_id**: do not reuse the same `instance_id` across machines; use a fresh UUID on conflict.
 4. **SSH service**: keep OpenSSH rather than Dropbear to avoid losing access in a proxied environment.
+5. **Never blanket-disable IPv6**: probe first — on a host that has it, disabling throws away a free native egress.
+6. **Pin EasyTier IPs**: `dhcp = true` lets addresses drift across reboots; use `dhcp = false` plus a fixed `ipv4`.
+7. **After touching boot params, check the route**: `ip link set eth0 down/up` drops that NIC's default route (this is not a DHCP outage). Run `ip route` before walking away.
 
 ---
 
