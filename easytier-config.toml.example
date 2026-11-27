@@ -1,0 +1,27 @@
+# /etc/easytier/config.toml
+# EasyTier 配置模板 (已脱敏) - 部署时替换占位符
+# 参考: https://github.com/EasyTier/EasyTier
+
+instance_name = "YOUR_INSTANCE_NAME"
+# 每台机器必须使用唯一 UUID, 不要复用
+instance_id = "00000000-0000-0000-0000-000000000000"
+dhcp = true
+listeners = [
+"tcp://0.0.0.0:11010",
+"udp://0.0.0.0:11010",
+]
+
+[network_identity]
+network_name = "YOUR_NETWORK_NAME"
+network_secret = "YOUR_NETWORK_SECRET"
+
+# 引导节点 (能连到的任意成员地址)
+[[peer]]
+uri = "tcp://YOUR_BOOTSTRAP_IP:11010"
+
+[[peer]]
+uri = "udp://YOUR_BOOTSTRAP_IP:11010"
+
+[flags]
+enable_ipv6 = false
+latency_first = true

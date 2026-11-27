@@ -1,0 +1,17 @@
+#!/sbin/openrc-run
+# /etc/init.d/easytier
+# EasyTier OpenRC 服务定义 - 部署: install -m 755 easytier-openrc /etc/init.d/easytier
+
+name="easytier"
+description="EasyTier P2P VPN"
+command="/usr/local/bin/easytier-core"
+command_args="-c /etc/easytier/config.toml"
+command_background="yes"
+pidfile="/run/easytier.pid"
+output_log="/var/log/easytier.log"
+error_log="/var/log/easytier.err"
+
+depend() {
+    need net
+    after firewall
+}

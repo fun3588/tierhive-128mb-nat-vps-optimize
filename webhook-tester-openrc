@@ -1,0 +1,17 @@
+#!/sbin/openrc-run
+# /etc/init.d/webhook-tester
+# webhook-tester OpenRC service definition - deploy: install -m 755 webhook-tester-openrc /etc/init.d/webhook-tester
+
+name="webhook-tester"
+description="Self-hosted webhook testing tool (fs persistent storage)"
+command="/usr/local/bin/webhook-tester"
+command_args="start --port 8081 --storage-driver fs --fs-storage-dir /var/lib/webhook-tester"
+command_background="yes"
+pidfile="/run/webhook-tester.pid"
+output_log="/var/log/webhook-tester.log"
+error_log="/var/log/webhook-tester.err"
+
+depend() {
+    need net
+    after firewall
+}
